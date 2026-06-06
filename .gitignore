@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+desktop-cat.zip
+*_src.png
+clean*.py
+finalize.py
+inspect.py
+montage.py
+prepare.py
+source.png
