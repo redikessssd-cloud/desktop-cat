@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Desktop Cat — autonomous pixel cat pet.
-Walks left/right, climbs onto your windows and scratches them, sleeps,
-follows the mouse with its eyes, reacts to typing, can be dragged
-(mochi-stretch), and poops a 💩 emoji.
-Needs: pip install pillow pynput   (pynput optional, for typing reaction)
+"""Desktop Cat — autonomous pixel cat pet (v4: smooth squash & stretch).
+
+What's new in v4 ("juice", inspired by the technique behind desktop pets):
+  * Procedural squash-and-stretch on every action (breathing idle, walk bob,
+    landing spring after you drop it, typing tap) — rendered live with Pillow.
+  * Eased walking (smooth accelerate / decelerate) instead of robotic steps.
+  * Robust reactions: the cat now reacts to typing from ANY state, and its
+    pupils always follow the mouse (with a fallback if eyes aren't detected).
+
+Still here: climbs your windows and scratches them, sleeps, can be dragged
+(mochi-stretch), poops a 💩 emoji, right-click menu.
+
+Needs:  pip install pillow pynput      (pynput = global typing/mouse reaction)
 Keep cat.py together with the cat_*.png sprite files.
 """
 import os
@@ -28,8 +36,8 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 TRANSPARENT = "#ff4dff"   # magic color that becomes click-through / invisible
 DISPLAY_H = 120           # on-screen cat height in px
 TICK = 33                 # ms per frame (~30 fps)
-BUBBLE_SPACE = 28         # px reserved above the cat for speech bubbles
-FOOT_PAD = 14             # px reserved below the cat
+BUBBLE_SPACE = 36         # px reserved above the cat for speech bubbles + stretch
+FOOT_PAD = 16             # px reserved below the cat
 
 SPRITE_FILES = {
     "sit":     "cat.png",
@@ -43,6 +51,13 @@ SPRITE_FILES = {
 }
 
 WINDOWS = sys.platform.startswith("win")
+
+
+def ease(t):
+    """Smoothstep easing 0..1 (ease-in-out)."""
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
 
 # ---------------------------------------------------------------------------
 # Windows: enumerate other top-level windows so the cat can climb on them.
@@ -155,9 +170,10 @@ class DesktopCat:
         self.sw = self.root.winfo_screenwidth()
         self.sh = self.root.winfo_screenheight()
 
-        # ---- load sprites ----
-        self.images = {}
-        self.sizes = {}
+        # ---- load sprites as PIL images (kept for live squash/stretch) ----
+        self.base = {}     # name -> {1: PIL Image, -1: flipped PIL Image}
+        self.sizes = {}    # name -> (w, h) at nominal display height
+        self._frame_cache = {}   # (name, facing, qsx, qsy) -> PhotoImage
         maxw = 80
         for name, fn in SPRITE_FILES.items():
             path = os.path.join(DIR, fn)
@@ -171,36 +187,34 @@ class DesktopCat:
             r = DISPLAY_H / im.height
             im = im.resize((max(1, int(im.width * r)), DISPLAY_H), Image.NEAREST)
             flip = im.transpose(Image.FLIP_LEFT_RIGHT)
-            self.images[name] = {1: ImageTk.PhotoImage(im), -1: ImageTk.PhotoImage(flip)}
+            self.base[name] = {1: im, -1: flip}
             self.sizes[name] = (im.width, im.height)
             maxw = max(maxw, im.width)
-        if "sit" not in self.images:
+        if "sit" not in self.base:
             im = make_fallback_cat().resize((DISPLAY_H, DISPLAY_H), Image.NEAREST)
-            self.images["sit"] = {1: ImageTk.PhotoImage(im), -1: ImageTk.PhotoImage(im)}
+            self.base["sit"] = {1: im, -1: im.transpose(Image.FLIP_LEFT_RIGHT)}
             self.sizes["sit"] = (DISPLAY_H, DISPLAY_H)
             maxw = max(maxw, DISPLAY_H)
 
         # detect eyes on the sit sprite (for mouse-following pupils)
-        self.eyes = []
-        self.pupil_r = 3
-        try:
-            _sp = Image.open(os.path.join(DIR, SPRITE_FILES["sit"])).convert("RGBA")
-            _r = DISPLAY_H / _sp.height
-            _sp = _sp.resize((max(1, int(_sp.width * _r)), DISPLAY_H), Image.NEAREST)
-            self.eyes, self.pupil_r = detect_eyes(_sp)
-        except Exception:
-            self.eyes = []
+        self.eyes, self.pupil_r = detect_eyes(self.base["sit"][1])
+        if not self.eyes:
+            w0, h0 = self.sizes["sit"]
+            self.eyes = [(w0 * 0.42, h0 * 0.34), (w0 * 0.58, h0 * 0.34)]
+            self.pupil_r = 3
 
-        self.winw = maxw + 40
+        self.winw = maxw + 60
         self.winh = BUBBLE_SPACE + DISPLAY_H + FOOT_PAD
         self.cx = self.winw // 2
-        self.cy = BUBBLE_SPACE + DISPLAY_H // 2
+        self.foot_y = BUBBLE_SPACE + DISPLAY_H   # ground line inside the window
 
         self.canvas = tk.Canvas(self.root, width=self.winw, height=self.winh,
                                  bg=TRANSPARENT, highlightthickness=0, bd=0)
         self.canvas.pack()
-        self.sprite_id = self.canvas.create_image(self.cx, self.cy,
-                                                   image=self.images["sit"][1])
+        self.sprite_id = self.canvas.create_image(self.cx, self.foot_y - DISPLAY_H // 2,
+                                                  image=self._get_frame("sit", 1, 1.0, 1.0))
+        self._rinfo = (self.cx, self.foot_y - DISPLAY_H / 2.0,
+                       self.sizes["sit"][0], self.sizes["sit"][1])
         self.bubble_ids = []
         self.pupil_ids = []
         for _ in self.eyes:
@@ -218,7 +232,13 @@ class DesktopCat:
         self.next_decision = time.time() + random.uniform(2, 4)
         self.next_meow = time.time() + random.uniform(8, 18)
         self.cur_sprite = "sit"
-        self.anim_phase = 0.0
+        self.walk_phase = 0.0
+        self.type_phase = 0.0
+        self.walk_from = self.x
+        self.walk_to = self.x
+        self.walk_start = 0.0
+        self.walk_dur = 1.0
+        self.land_t = -10.0
         self.type_until = 0.0
         self._was_typing = False
         self.poops = []
@@ -238,6 +258,7 @@ class DesktopCat:
 
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="Гулять", command=self.start_walk)
+        self.menu.add_command(label="Потянуться", command=self.start_stretch)
         self.menu.add_command(label="Поспать", command=self.start_sleep)
         self.menu.add_command(label="Поцарапать окно", command=self.start_window_hunt)
         self.menu.add_command(label="Покакать", command=self.drop_poop)
@@ -256,18 +277,43 @@ class DesktopCat:
         self.tick()
 
     # ------------------------------------------------------------------
-    def apply_geometry(self):
-        self.x = max(-20, min(self.sw - self.winw + 20, int(self.x)))
-        self.y = max(-10, min(self.sh - self.winh + 10, int(self.y)))
-        self.root.geometry("%dx%d+%d+%d" % (self.winw, self.winh, self.x, self.y))
+    # Live sprite rendering with squash & stretch (volume-aware).
+    # ------------------------------------------------------------------
+    def _get_frame(self, name, facing, sx, sy):
+        if name not in self.base:
+            name = "sit"
+        qsx = max(0.55, min(1.6, round(sx, 2)))
+        qsy = max(0.55, min(1.6, round(sy, 2)))
+        key = (name, facing, qsx, qsy)
+        ph = self._frame_cache.get(key)
+        if ph is None:
+            base = self.base[name][facing]
+            w, h = base.size
+            nw = max(1, int(round(w * qsx)))
+            nh = max(1, int(round(h * qsy)))
+            im = base if (nw == w and nh == h) else base.resize((nw, nh), Image.NEAREST)
+            ph = ImageTk.PhotoImage(im)
+            if len(self._frame_cache) > 600:
+                self._frame_cache.clear()
+            self._frame_cache[key] = ph
+        return ph
+
+    def _render(self, name, sx=1.0, sy=1.0, dx=0.0, dy=0.0):
+        if name not in self.base:
+            name = "sit"
+        img = self._get_frame(name, self.facing, sx, sy)
+        nw = img.width()
+        nh = img.height()
+        cx = self.cx + dx
+        cy = self.foot_y - nh / 2.0 + dy
+        self.canvas.itemconfig(self.sprite_id, image=img)
+        self.canvas.coords(self.sprite_id, cx, cy)
+        self.cur_sprite = name
+        self._rinfo = (cx, cy, nw, nh)
 
     def set_sprite(self, name):
-        if name not in self.images:
-            name = "sit"
-        self.cur_sprite = name
-        self.canvas.itemconfig(self.sprite_id, image=self.images[name][self.facing])
-        w, h = self.sizes[name]
-        self.canvas.coords(self.sprite_id, self.cx, BUBBLE_SPACE + h // 2)
+        """Render a sprite at neutral scale (compat helper)."""
+        self._render(name, 1.0, 1.0)
 
     def _update_pupils(self, mx, my):
         if not self.pupil_ids:
@@ -276,14 +322,18 @@ class DesktopCat:
             for pid in self.pupil_ids:
                 self.canvas.coords(pid, -20, -20, -19, -19)
             return
-        w, h = self.sizes["sit"]
-        left_x = self.cx - w // 2
+        cx, cy, nw, nh = self._rinfo
+        w0, h0 = self.sizes["sit"]
+        scale_x = nw / float(w0)
+        scale_y = nh / float(h0)
+        left = cx - nw / 2.0
+        top = cy - nh / 2.0
         for i, (ex, ey) in enumerate(self.eyes):
             if i >= len(self.pupil_ids):
                 break
-            sx = (w - ex) if self.facing == -1 else ex
-            canvas_x = left_x + sx
-            canvas_y = BUBBLE_SPACE + ey
+            ex2 = (w0 - ex) if self.facing == -1 else ex
+            canvas_x = left + ex2 * scale_x
+            canvas_y = top + ey * scale_y
             gx = self.x + canvas_x
             gy = self.y + canvas_y
             dx = mx - gx
@@ -303,7 +353,7 @@ class DesktopCat:
         for i in self.bubble_ids:
             self.canvas.delete(i)
         self.bubble_ids = []
-        x, y = self.cx, 14
+        x, y = self.cx, 16
         if kind == "emoji":
             t = self.canvas.create_text(x, y, text=text, font=("Segoe UI Emoji", 16))
             self.bubble_ids.append(t)
@@ -328,7 +378,7 @@ class DesktopCat:
     # ------------------------------------------------------------------
     def drop_poop(self):
         fx = self.x + self.cx
-        fy = self.y + BUBBLE_SPACE + DISPLAY_H - 18
+        fy = self.y + self.foot_y - 18
         try:
             p = tk.Toplevel(self.root)
             p.overrideredirect(True)
@@ -363,8 +413,19 @@ class DesktopCat:
 
     # ------------------------------------------------------------------
     def start_walk(self):
-        self.target = (random.randint(0, max(1, self.sw - self.winw)), self.ground_y)
+        tx = random.randint(0, max(1, self.sw - self.winw))
+        self.walk_from = self.x
+        self.walk_to = tx
+        self.walk_start = time.time()
+        self.walk_dur = max(0.6, abs(tx - self.x) / 120.0)
+        self.facing = -1 if tx < self.x else 1
+        self.y = self.ground_y
         self.state = "walk"
+
+    def start_stretch(self):
+        self.state = "stretch"
+        self.state_until = time.time() + 1.6
+        self.say(random.choice(["ня~", "мрр", "х-хаа"]))
 
     def start_sleep(self):
         self.state = "sleep"
@@ -409,6 +470,7 @@ class DesktopCat:
 
         typing = now < self.type_until
 
+        # --- being dragged: mochi stretch following the cursor ---
         if self.drag:
             self._render_drag()
             self._update_pupils(mx, my)
@@ -416,22 +478,36 @@ class DesktopCat:
             self.root.after(TICK, self.tick)
             return
 
+        # --- typing reaction overrides everything (except sleep) ---
+        if typing and self.state != "sleep":
+            self.type_phase += 0.9
+            s = abs(math.sin(self.type_phase))
+            self.facing = -1 if mx < self.x + self.cx else 1
+            self._render("type", 1.0 + 0.03 * s, 1.0 - 0.05 * s, 0.0, 4.0 * s)
+            if not self._was_typing:
+                self.say(random.choice(["мяу!", "тык-тык!", "мур?"]))
+            elif random.random() < 0.02:
+                self.say(random.choice(["мяу", "мур", "ня", "тык-тык"]))
+            self._update_pupils(mx, my)
+            self.apply_geometry()
+            self._was_typing = typing
+            self.root.after(TICK, self.tick)
+            return
+
         st = self.state
 
         if st == "idle":
-            if typing:
-                self.set_sprite("type")
-                self.anim_phase += 0.6
-                bob = abs(math.sin(self.anim_phase)) * 4
-                w, h = self.sizes["type"]
-                self.canvas.coords(self.sprite_id, self.cx, BUBBLE_SPACE + h // 2 + bob)
-                if not self._was_typing:
-                    self.say("тык-тык!")
-                elif random.random() < 0.03:
-                    self.say(random.choice(["мяу", "мур", "тык-тык"]))
+            self.facing = -1 if mx < self.x + self.cx else 1
+            if now - self.land_t < 0.5:
+                # landing spring after being dropped
+                e = (now - self.land_t) / 0.5
+                sy = 1.0 - 0.32 * math.cos(e * 10.0) * math.exp(-3.2 * e)
+                sx = (1.0 / max(0.45, sy)) ** 0.5
+                self._render("sit", sx, sy)
             else:
-                self.facing = -1 if mx < self.x + self.cx else 1
-                self.set_sprite("sit")
+                # gentle breathing
+                br = math.sin(now * 2.2)
+                self._render("sit", 1.0 - 0.025 * br, 1.0 + 0.03 * br)
                 if now > self.next_meow:
                     self.say(random.choice(["мяу", "мяу~", "мур", "ня"]))
                     self.next_meow = now + random.uniform(8, 20)
@@ -439,34 +515,47 @@ class DesktopCat:
                     self._decide()
 
         elif st == "walk":
-            self.set_sprite("walk")
-            tx, ty = self.target
-            self.facing = -1 if tx < self.x else 1
-            self.x, dx_done = self._approach(self.x, tx, 4.0)
-            self.y, dy_done = self._approach(self.y, ty, 4.0)
-            self.anim_phase += 0.3
-            self.y += math.sin(self.anim_phase) * 1.2
-            if dx_done and dy_done:
+            e = (now - self.walk_start) / self.walk_dur
+            if e >= 1.0:
+                self.x = self.walk_to
                 self.state = "idle"
                 self.next_decision = now + random.uniform(2, 5)
-            if now > self.next_meow and random.random() < 0.3:
-                self.say(random.choice(["мяу", "мур~"]))
-                self.next_meow = now + random.uniform(8, 20)
+                self.set_sprite("sit")
+            else:
+                self.x = self.walk_from + (self.walk_to - self.walk_from) * ease(e)
+                self.walk_phase += 0.35
+                lift = abs(math.sin(self.walk_phase))
+                sy = 1.0 + 0.05 * math.sin(self.walk_phase * 2.0)
+                sx = 1.0 - 0.04 * math.sin(self.walk_phase * 2.0)
+                self._render("walk", sx, sy, 0.0, -4.0 * lift)
+                if now > self.next_meow and random.random() < 0.2:
+                    self.say(random.choice(["мяу", "мур~"]))
+                    self.next_meow = now + random.uniform(8, 20)
+
+        elif st == "stretch":
+            e = (now - (self.state_until - 1.6)) / 1.6
+            k = math.sin(min(1.0, max(0.0, e)) * math.pi)
+            self._render("stretch", 1.0 - 0.12 * k, 1.0 + 0.22 * k, 0.0, -6.0 * k)
+            if now > self.state_until:
+                self.state = "idle"
+                self.next_decision = now + random.uniform(2, 5)
 
         elif st == "goto_window":
-            self.set_sprite("walk")
             tx, ty = self.target
             self.facing = -1 if tx < self.x else 1
             self.x, dxd = self._approach(self.x, tx, 4.5)
+            self.walk_phase += 0.35
+            lift = abs(math.sin(self.walk_phase))
+            self._render("walk", 1.0, 1.0, 0.0, -4.0 * lift)
             if dxd:
                 self.target = self.scratch_target
                 self.state = "climb"
 
         elif st == "climb":
-            self.set_sprite("stand")
             tx, ty = self.target
             self.x, dxd = self._approach(self.x, tx, 4.0)
             self.y, dyd = self._approach(self.y, ty, 4.0)
+            self.set_sprite("stand")
             if dxd and dyd:
                 self.state = "scratch_window"
                 self.state_until = now + 2.4
@@ -474,18 +563,19 @@ class DesktopCat:
                 self.say("царап-царап!")
 
         elif st == "scratch_window":
-            self.set_sprite("scratch")
-            self.x += math.sin(now * 22) * 1.5
+            self._render("scratch", 1.0, 1.0, math.sin(now * 22) * 1.5, 0.0)
             if random.random() < 0.03:
                 self.say(random.choice(["царап!", "мяу!", "мур"]))
             if now > self.state_until:
                 self.drop_poop()
                 self.state = "idle"
+                self.y = self.ground_y
                 self.next_decision = now + random.uniform(3, 6)
                 self.cooldown_window = now + random.uniform(15, 30)
 
         elif st == "sleep":
-            self.set_sprite("sleep")
+            br = math.sin(now * 1.4)
+            self._render("sleep", 1.0 - 0.02 * br, 1.0 + 0.025 * br)
             if random.random() < 0.01:
                 self.say("z z z")
             if now > self.state_until:
@@ -493,8 +583,7 @@ class DesktopCat:
                 self.next_decision = now + random.uniform(2, 4)
 
         elif st == "scratch":
-            self.set_sprite("scratch")
-            self.x += math.sin(now * 22) * 1.2
+            self._render("scratch", 1.0, 1.0, math.sin(now * 22) * 1.2, 0.0)
             if now > self.state_until:
                 if random.random() < 0.5:
                     self.drop_poop()
@@ -508,12 +597,14 @@ class DesktopCat:
 
     def _decide(self):
         now = time.time()
-        choices = ["walk", "walk", "sleep", "scratch"]
+        choices = ["walk", "walk", "stretch", "sleep", "scratch"]
         if now > self.cooldown_window and (not WINDOWS or list_windows(self.title)):
             choices += ["window", "window"]
         pick = random.choice(choices)
         if pick == "walk":
             self.start_walk()
+        elif pick == "stretch":
+            self.start_stretch()
         elif pick == "sleep":
             self.start_sleep()
         elif pick == "scratch":
@@ -521,20 +612,27 @@ class DesktopCat:
         elif pick == "window":
             self.start_window_hunt()
 
+    def apply_geometry(self):
+        self.x = max(-20, min(self.sw - self.winw + 20, int(self.x)))
+        self.y = max(-10, min(self.sh - self.winh + 10, int(self.y)))
+        self.root.geometry("%dx%d+%d+%d" % (self.winw, self.winh, self.x, self.y))
+
     # ------------------------------------------------------------------
     def _render_drag(self):
-        base = self.images.get("stretch", self.images["sit"])
-        self.canvas.itemconfig(self.sprite_id, image=base[self.facing])
-        w, h = self.sizes.get("stretch", self.sizes["sit"])
-        self.canvas.coords(self.sprite_id, self.cx, BUBBLE_SPACE + h // 2)
-        self.cur_sprite = "stretch"
+        vy = 0.0
+        if self.press_xy is not None:
+            vy = abs(self.y - getattr(self, "_last_drag_y", self.y))
+        self._last_drag_y = self.y
+        stretch = min(0.28, vy / 60.0)
+        self._render("stretch", 1.0 - 0.6 * stretch, 1.0 + stretch)
 
     def on_press(self, e):
         self.drag = True
         self.press_xy = (e.x_root, e.y_root)
+        self._last_drag_y = self.y
         self.drag_dx = e.x_root - self.x
         self.drag_dy = e.y_root - self.y
-        self.set_sprite("stretch")
+        self._render("stretch", 1.0, 1.0)
 
     def on_drag(self, e):
         if not self.drag:
@@ -548,7 +646,9 @@ class DesktopCat:
         moved = 0
         if self.press_xy:
             moved = abs(e.x_root - self.press_xy[0]) + abs(e.y_root - self.press_xy[1])
+        self.y = self.ground_y
         self.state = "idle"
+        self.land_t = time.time()    # trigger landing spring
         self.next_decision = time.time() + random.uniform(1, 3)
         if moved < 4:
             self.say(random.choice(["мяу~", "мур", "❤", "ня"]))
@@ -560,6 +660,7 @@ class DesktopCat:
             self.menu.grab_release()
 
     def _on_key(self, key):
+        # runs on the pynput listener thread; a single float store is GIL-safe
         self.type_until = time.time() + 1.3
 
     def quit(self):
@@ -579,7 +680,7 @@ class DesktopCat:
 
 if __name__ == "__main__":
     if HAVE_PYNPUT:
-        print("[cat] typing reaction: ON")
+        print("[cat] typing/mouse reaction: ON")
     else:
         print("[cat] pynput NOT installed -> typing reaction OFF."
               "  Install with:  pip install pynput")
