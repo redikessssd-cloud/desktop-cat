@@ -458,7 +458,7 @@ class DesktopCat:
             return tgt, True
         return cur + step * (1 if tgt > cur else -1), False
 
-    def tick(self):
+    def _step(self):
         now = time.time()
         try:
             mx, my = self.root.winfo_pointerxy()
@@ -475,15 +475,14 @@ class DesktopCat:
             self._render_drag()
             self._update_pupils(mx, my)
             self._was_typing = typing
-            self.root.after(TICK, self.tick)
             return
 
         # --- typing reaction overrides everything (except sleep) ---
         if typing and self.state != "sleep":
-            self.type_phase += 0.9
+            self.type_phase += 0.45
             s = abs(math.sin(self.type_phase))
-            self.facing = -1 if mx < self.x + self.cx else 1
-            self._render("type", 1.0 + 0.03 * s, 1.0 - 0.05 * s, 0.0, 4.0 * s)
+            self._face_toward(mx)
+            self._render("type", 1.0 + 0.012 * s, 1.0 - 0.018 * s, 0.0, 1.0 * s)
             if not self._was_typing:
                 self.say(random.choice(["мяу!", "тык-тык!", "мур?"]))
             elif random.random() < 0.02:
@@ -491,13 +490,26 @@ class DesktopCat:
             self._update_pupils(mx, my)
             self.apply_geometry()
             self._was_typing = typing
-            self.root.after(TICK, self.tick)
+            return
+
+        # hover-to-pause: when the cursor is over the cat, hold still so
+        # it's easy to grab and drag (the transparent padding counts too)
+        over = (self.x <= mx <= self.x + self.winw and
+                self.y <= my <= self.y + self.winh)
+        if over and self.state in ("idle", "walk"):
+            self.state = "idle"
+            self.next_decision = now + random.uniform(1.5, 3.0)
+            self._face_toward(mx)
+            self._render("sit", 1.0, 1.0)
+            self._update_pupils(mx, my)
+            self.apply_geometry()
+            self._was_typing = typing
             return
 
         st = self.state
 
         if st == "idle":
-            self.facing = -1 if mx < self.x + self.cx else 1
+            self._face_toward(mx)
             if now - self.land_t < 0.5:
                 # landing spring after being dropped
                 e = (now - self.land_t) / 0.5
@@ -534,6 +546,7 @@ class DesktopCat:
 
         elif st == "stretch":
             e = (now - (self.state_until - 1.6)) / 1.6
+            # ease into a big vertical stretch, then settle back
             k = math.sin(min(1.0, max(0.0, e)) * math.pi)
             self._render("stretch", 1.0 - 0.12 * k, 1.0 + 0.22 * k, 0.0, -6.0 * k)
             if now > self.state_until:
@@ -593,7 +606,22 @@ class DesktopCat:
         self._update_pupils(mx, my)
         self.apply_geometry()
         self._was_typing = typing
+
+    def tick(self):
+        # crash-safe loop: one bad frame must never freeze the cat
+        try:
+            self._step()
+        except Exception:
+            pass
         self.root.after(TICK, self.tick)
+
+    def _face_toward(self, mx):
+        # 40px deadzone so the cat doesn't flip left/right on tiny mouse jitter
+        center = self.x + self.cx
+        if mx < center - 40:
+            self.facing = -1
+        elif mx > center + 40:
+            self.facing = 1
 
     def _decide(self):
         now = time.time()
@@ -619,6 +647,7 @@ class DesktopCat:
 
     # ------------------------------------------------------------------
     def _render_drag(self):
+        # vertical mochi stretch based on how fast it's pulled
         vy = 0.0
         if self.press_xy is not None:
             vy = abs(self.y - getattr(self, "_last_drag_y", self.y))
